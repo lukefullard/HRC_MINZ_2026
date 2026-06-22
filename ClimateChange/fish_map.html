@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fish Data Map Explorer (Excel Version)</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6.5.0/turf.min.js"></script>
+    
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+
+    <style>
+        body { 
+            margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            display: flex; flex-direction: column; height: 100vh; background-color: #f0f2f5;
+        }
+        #controls { 
+            padding: 15px 20px; background: white; border-bottom: 2px solid #ddd; 
+            display: flex; gap: 20px; align-items: center; flex-wrap: wrap; box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            z-index: 1000;
+        }
+        #map { flex: 1; width: 100%; }
+        .control-group { 
+            display: flex; gap: 8px; align-items: center; 
+            border-right: 1px solid #ccc; padding-right: 20px;
+        }
+        .control-group:last-child { border-right: none; }
+        button { 
+            padding: 6px 12px; cursor: pointer; background-color: #007bff; color: white; 
+            border: none; border-radius: 4px; font-weight: bold;
+        }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        input[type="number"] { padding: 5px; width: 90px; border: 1px solid #ccc; border-radius: 4px; }
+        label { font-weight: bold; color: #333; }
+        #statusText { font-size: 0.9em; color: #555; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="controls">
+        <div class="control-group">
+            <label>1. Load Excel File:</label>
+            <input type="file" id="excelFileInput" accept=".xlsx, .xls, .csv" />
+        </div>
+        
+        <div class="control-group">
+            <label>2. Zoom to:</label>
+            <input type="number" id="latInput" placeholder="Lat (e.g. -40.4)" step="any" />
+            <input type="number" id="lngInput" placeholder="Lon (e.g. 175.6)" step="any" />
+            <button id="zoomBtn">Go</button>
+        </div>
+
+        <div class="control-group">
+            <label>3. Filter & Export:</label>
+            <span id="statusText">Awaiting Data...</span>
+            <button id="downloadBtn" disabled>Download Polygon Data (.xlsx)</button>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+        // 1. Initialize the Leaflet Map
+        const map = L.map('map').setView([-40.9006, 174.8860], 6); // Centered on NZ
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        // 2. Setup Drawing Controls
+        const drawnItems = new L.FeatureGroup();
+        map.addLayer(drawnItems);
+        const drawControl = new L.Control.Draw({
+            draw: {
+                polyline: false, marker: false, circlemarker: false, circle: false,
+                polygon: true, rectangle: true // Polygons and rectangles for filtering
+            },
+            edit: { featureGroup: drawnItems }
+        });
+        map.addControl(drawControl);
+
+        // Global state variables
+        let allData = []; 
+        let pointGeoJSON = null; 
+        let markersGroup = L.layerGroup().addTo(map);
+        let filteredData = [];
+
+        // 3. Load and Parse Excel (.xlsx) File using SheetJS
+        document.getElementById('excelFileInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            document.getElementById('statusText').innerText = "Reading Excel file...";
+            
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                try {
+                    const data = new Uint8Array(event.target.result);
+                    const workbook = XLSX.read(data, { type: 'array' });
+                    
+                    // Grab the first sheet in the workbook
+                    const firstSheetName = workbook.SheetNames[0];
+                    const worksheet = workbook.Sheets[firstSheetName];
+                    
+                    // Convert that sheet to an array of JSON objects
+                    allData = XLSX.utils.sheet_to_json(worksheet);
+                    
+                    if (allData.length > 0) {
+                        plotData();
+                    } else {
+                        document.getElementById('statusText').innerText = "Excel sheet appears empty.";
+                    }
+                } catch (error) {
+                    console.error(error);
+                    document.getElementById('statusText').innerText = "Error reading Excel file.";
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        // 4. Plot Data on the Map
+        function plotData() {
+            markersGroup.clearLayers();
+            let turfFeaturePoints = [];
+            
+            allData.forEach((row, index) => {
+                const lat = parseFloat(row.decimalLatitude);
+                const lng = parseFloat(row.decimalLongitude);
+                
+                if (!isNaN(lat) && !isNaN(lng)) {
+                    const marker = L.circleMarker([lat, lng], {
+                        radius: 4, color: '#ff3300', weight: 1, opacity: 0.8, fillOpacity: 0.6
+                    });
+                    marker.bindPopup(`<b>${row.taxonCommonName || 'Fish'}</b><br>Lat: ${lat}<br>Lon: ${lng}`);
+                    markersGroup.addLayer(marker);
+                    
+                    // Keep original array index to map back to full data later
+                    turfFeaturePoints.push(turf.point([lng, lat], { originalIndex: index }));
+                }
+            });
+            
+            pointGeoJSON = turf.featureCollection(turfFeaturePoints);
+            
+            document.getElementById('statusText').innerText = `Loaded ${turfFeaturePoints.length} valid coordinates. Draw a shape!`;
+            
+            // Zoom to fit points
+            if (turfFeaturePoints.length > 0) {
+                const bounds = turf.bbox(pointGeoJSON);
+                map.fitBounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]]);
+            }
+        }
+
+        // 5. Zoom functionality
+        document.getElementById('zoomBtn').addEventListener('click', () => {
+            const lat = parseFloat(document.getElementById('latInput').value);
+            const lng = parseFloat(document.getElementById('lngInput').value);
+            if (!isNaN(lat) && !isNaN(lng)) {
+                map.flyTo([lat, lng], 13);
+            } else {
+                alert("Please enter valid decimal latitude and longitude.");
+            }
+        });
+
+        // 6. Handle Polygon Draw Event
+        map.on(L.Draw.Event.CREATED, function (e) {
+            drawnItems.clearLayers(); 
+            const layer = e.layer;
+            drawnItems.addLayer(layer);
+            
+            if (!pointGeoJSON) {
+                alert("Please load an Excel file first!");
+                drawnItems.clearLayers();
+                return;
+            }
+
+            const polygonGeoJSON = layer.toGeoJSON();
+            const ptsWithin = turf.pointsWithinPolygon(pointGeoJSON, polygonGeoJSON);
+            
+            filteredData = ptsWithin.features.map(f => allData[f.properties.originalIndex]);
+            
+            document.getElementById('statusText').innerText = `Shape selected ${filteredData.length} data points.`;
+            document.getElementById('downloadBtn').disabled = filteredData.length === 0;
+        });
+
+        // 7. Download Filtered Data as a new Excel (.xlsx) file
+        document.getElementById('downloadBtn').addEventListener('click', () => {
+            if (filteredData.length === 0) return;
+            
+            // Convert filtered JSON back into a new Excel worksheet
+            const newWorksheet = XLSX.utils.json_to_sheet(filteredData);
+            
+            // Create a new workbook and attach the sheet
+            const newWorkbook = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(newWorkbook, newWorksheet, "Filtered Fish Data");
+            
+            // Trigger download
+            XLSX.writeFile(newWorkbook, "filtered_polygon_data.xlsx");
+        });
+    </script>
+</body>
+</html>
